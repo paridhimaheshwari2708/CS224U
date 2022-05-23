@@ -27,7 +27,9 @@ english_word_sememe.py is used to generate the corresponding language sememe dat
 
 ### 2.2  Modify files in the Transformer Python library
 
-Modify the modeling_bert.py file in the Transformer Python library and add three Classes (SememeEmbeddings, BertSememeEmbeddings, BertSememeModel) from bert_english_sememe.py. Note that change the path of the corresponding sememe data in the SememeEmbeddings Class. Then add the BertSememeModel Class to the __init__.py file in the Transformer Python library.
+Modify the modeling_bert.py file in the Transformer Python library and add three Classes (SememeEmbeddings, BertSememeEmbeddings, BertSememeModel) from bert_english_sememe.py. Then add the BertSememeModel Class to the __init__.py file in the Transformer Python library.
+
+Modify the modeling_distilbert.py file in the Transformer Python library and add three Classes (DistilBertSememeEmbeddings, DistilBertSememeModel) from distilbert_english_sememe.py. Then add the DistilBertSememeModel Class to the __init__.py file in the Transformer Python library.
 
 ### 2.3  Model training and testing
 
