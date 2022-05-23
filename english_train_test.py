@@ -14,10 +14,11 @@ from transformers import AdamW, AutoTokenizer, AutoModel, BertSememeModel, Rober
 random.seed(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
-batch = 4
-sample_num = 19
-learning_rate = 3e-5
 
+BATCH_SIZE = 4
+NUM_NEGATIVES = 19
+learning_rate = 3e-5
+NUM_EPOCHS = 40
 
 # load english dataset
 def load_data(path):
@@ -96,7 +97,7 @@ def generate_quotes(quote, num):
 
 
 def make_quote_tensors(quote):
-	quotes = generate_quotes(quote, num=sample_num)
+	quotes = generate_quotes(quote, num=NUM_NEGATIVES)
 	label = quotes.index(quote)
 	input_ids = []
 	encoded_dict = tokenizer.batch_encode_plus(quotes,
@@ -541,8 +542,8 @@ if __name__ == '__main__':
 							mask_ids=valid_mask_ids,
 							quote=valid_quote)
 
-	train_loader = DataLoader(dataset=train_dataset, batch_size=batch, shuffle=True, num_workers=2)
-	valid_loader = DataLoader(dataset=valid_dataset, batch_size=batch, shuffle=True, num_workers=2)
+	train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+	valid_loader = DataLoader(dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
 	print('loading model......')
 	contex_model = Context_Encoder()
@@ -551,7 +552,7 @@ if __name__ == '__main__':
 	model.to(device)
 
 	training(model=model,
-			epoch=40,
+			epoch=NUM_EPOCHS,
 			train=train_loader,
 			valid=valid_loader,
 			device=device)
@@ -590,7 +591,7 @@ if __name__ == '__main__':
 
 	print('start training......')
 	training_mask(model=model,
-				  epoch=40,
+				  epoch=NUM_EPOCHS,
 				  train=train_loader,
 				  valid=valid_loader,
 				  quote_tensor=quote_embeddings,
