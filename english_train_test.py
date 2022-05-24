@@ -9,16 +9,13 @@ import torch.nn as nn
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score
 from torch.utils.data import Dataset, DataLoader
-from transformers import AdamW, AutoTokenizer, AutoModel, BertSememeModel, RobertaSememeModel, DistilBertSememeModel
+from transformers import AdamW, AutoTokenizer, AutoModel, BertSememeModel, RobertaSememeModel, DistilBertSememeModel, MobileBertSememeModel
 
 random.seed(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
 
-BATCH_SIZE = 4
-NUM_NEGATIVES = 19
 learning_rate = 3e-5
-NUM_EPOCHS = 40
 
 # load english dataset
 def load_data(path):
@@ -86,18 +83,32 @@ class Dataset(Dataset):
 		return self.input_ids[idx], self.token_type_ids[idx], self.attention_masks[idx], self.mask_ids[idx], self.quote[idx]
 
 
-#  generat negative examples according to num
-def generate_quotes(quote, num):
-	quotes_select = all_quotes[:]
-	quotes_select.remove(quote)
-	quotes = random.sample(quotes_select, num)
-	quotes.append(quote)
+#  Generate negative examples according to num
+def generate_quotes(quote, num, method):
+	pos_quote = quote
+	if SAMPLING_STRATEGY == 'random':
+		quotes_select = all_quotes[:]
+		quotes_select.remove(quote)
+		neg_quotes = random.sample(quotes_select, num)
+	elif SAMPLING_STRATEGY == 'probability':
+		pos_idx = all_quotes.index(quote)
+		similarities = all_quote_similarities[pos_idx, :]
+		neg_probs = (1-similarities) / np.sum(1-similarities) # range is [0, 1]
+		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), size=num, p=neg_probs)
+		neg_quotes = [all_quotes[i] for i in neg_idx]
+	elif SAMPLING_STRATEGY == 'extreme':
+		pos_idx = all_quotes.index(quote)
+		similarities = all_quote_similarities[pos_idx]
+		sorted_idx = np.argsort(similarities)
+		neg_idx = sorted_idx[:num]
+		neg_quotes = [all_quotes[i] for i in neg_idx]
+	quotes = neg_quotes + [pos_quote]
 	random.shuffle(quotes)
-	return quotes
+	return pos_quote, quotes
 
 
 def make_quote_tensors(quote):
-	quotes = generate_quotes(quote, num=NUM_NEGATIVES)
+	quote, quotes = generate_quotes(quote, num=NUM_NEGATIVES, method=SAMPLING_STRATEGY)
 	label = quotes.index(quote)
 	input_ids = []
 	encoded_dict = tokenizer.batch_encode_plus(quotes,
@@ -119,7 +130,6 @@ class Context_Encoder(nn.Module):
 		self.dropout = nn.Dropout(0.5)
 
 	def forward(self, context_input_ids, context_token_type_ids, context_attention_masks, mask_ids):
-		# Paridhi TODO: This forward pass is the ottleneck in this function
 		outputs = self.bert_model(input_ids=context_input_ids,
 								  token_type_ids=context_token_type_ids,
 								  attention_mask=context_attention_masks)
@@ -145,10 +155,11 @@ class Quote_Encoder(nn.Module):
 			self.bert_model = RobertaSememeModel.from_pretrained(PRETRAINED_MODEL_NAME)
 		elif base == 'distilbert':
 			self.bert_model = DistilBertSememeModel.from_pretrained(PRETRAINED_MODEL_NAME)
+		elif base == 'mobilebert':
+			self.bert_model = MobileBertSememeModel.from_pretrained(PRETRAINED_MODEL_NAME)
 		# self.dropout = nn.Dropout(0.5)
 
 	def forward(self, quotes):
-		# Paridhi TODO: remove loop here?
 		quote_tensor = []
 		labels = []
 		for quote in quotes:
@@ -220,7 +231,7 @@ def training(model, epoch, train, valid, device):
 			acc = accuracy_score(pred, labels.cpu())
 			total_loss += loss.item()
 			total_acc += acc
-		print('Train | Loss: {:.5f} Acc:{:.3f}'.format(total_loss, total_acc / t_batch))
+		print('Train | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / t_batch))
 
 		# Validation
 		model.eval()
@@ -238,13 +249,12 @@ def training(model, epoch, train, valid, device):
 				acc = accuracy_score(pred, labels.cpu())
 				total_loss += loss.item()
 				total_acc += acc
-			print('Valid | Loss: {:.5f} Acc:{:.3f}'.format(total_loss, total_acc / v_batch))
+			print('Valid | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / v_batch))
 
 			if total_acc > best_acc:
 				best_acc = total_acc
-				os.makedirs('model', exist_ok=True)
-				torch.save(model.quote_model.state_dict(), f'./model/{args.base}_english_quote.pth')
-				torch.save(model.contex_model.state_dict(), f'./model/{args.base}_english_context.pth')
+				torch.save(model.quote_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_quote.pth')
+				torch.save(model.contex_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_context.pth')
 				print('saving model with Acc {:.3f} '.format(total_acc / v_batch))
 				count = 0
 			else:
@@ -417,7 +427,7 @@ def training_mask(model, epoch, train, valid, quote_tensor, device):
 
 		if total_MRR > best_MRR:
 			best_MRR = total_MRR
-			torch.save(model, f'./model/{args.base}_model_english.model')
+			torch.save(model, f'./model/{MODEL_SAVE_PATH}/model_english.model')
 			print('saving model with MRR {:.3f} NDCG: {:.3f}'.format(total_MRR / v_batch, total_NDCG / v_batch))
 			count = 0
 		else:
@@ -431,7 +441,7 @@ def training_mask(model, epoch, train, valid, quote_tensor, device):
 
 
 def test(model, test_loader, quote_tensor, device):
-	print('start test......')
+	print('start test')
 	model.eval()
 	t_batch = len(test_loader)
 	criterion = nn.CrossEntropyLoss()
@@ -489,10 +499,22 @@ def test(model, test_loader, quote_tensor, device):
 if __name__ == '__main__':
 
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--base", dest="base", action="store", type=str, choices=['bert', 'roberta', 'distilbert'])
-	# parser.add_argument("--pooling", dest="pooling", action="store", type=str, choices=['cls', 'mean'])
-	# parser.add_argument("--sampling", dest="sampling", action="store", type=str, choices=['random', 'extreme', 'probability', 'reject'])
+	parser.add_argument("--base", dest="base", action="store", type=str, choices=['bert', 'roberta', 'distilbert', 'mobilebert'])
+	parser.add_argument("--pooling", dest="pooling", action="store", type=str, default='mean', choices=['cls', 'mean'])
+	parser.add_argument("--sampling", dest="sampling", action="store", type=str, default='random', choices=['random', 'extreme', 'probability'])
+	parser.add_argument("--batch_size", dest="batch_size", action="store", type=int, default=4)
+	parser.add_argument("--num_epochs", dest="num_epochs", action="store", type=int, default=40)
+	parser.add_argument("--num_negatives", dest="num_negatives", action="store", type=int, default=19)
 	args = parser.parse_args()
+
+	NUM_NEGATIVES = args.num_negatives
+	BATCH_SIZE = args.batch_size
+	NUM_EPOCHS = args.num_epochs
+	SAMPLING_STRATEGY = args.sampling
+
+	MODEL_SAVE_PATH = f'{args.base}_{SAMPLING_STRATEGY}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}'
+	os.makedirs(f'model/{MODEL_SAVE_PATH}', exist_ok=True)
+	print(f'Model: {MODEL_SAVE_PATH}')
 
 	if args.base == 'bert':
 		PRETRAINED_MODEL_NAME = 'bert-base-uncased'
@@ -500,8 +522,10 @@ if __name__ == '__main__':
 		PRETRAINED_MODEL_NAME = 'roberta-base'
 	elif args.base == 'distilbert':
 		PRETRAINED_MODEL_NAME = 'distilbert-base-uncased'
+	elif args.base == 'mobilebert':
+		PRETRAINED_MODEL_NAME = 'google/mobilebert-uncased'
 
-	print('loading dataset......')
+	print('Loading dataset')
 	data_path = './data/english.txt'
 	train_former, train_latter, train_quote, valid_former, valid_latter, valid_quote, test_former, test_latter, test_quote, y_train, y_valid, y_test, all_quotes = load_data(data_path)
 	all_quotes_dict = {quote:idx for idx, quote in enumerate(all_quotes)}
@@ -512,25 +536,23 @@ if __name__ == '__main__':
 	print('test quote:', len(list(set(test_quote))))
 
 	# Loading quote similarities for weak supervision
-	# with open(f'data/similarities_sentence_bert_{args.pooling}.pkl', 'rb') as f:
-	# 	all_quote_similarities = pickle.load(f)
-	# assert all_quotes == all_quote_similarities['quotes']
-	# all_quote_similarities = all_quote_similarities['similarities']
+	with open(f'data/similarities_{args.pooling}.pkl', 'rb') as f:
+		dat = pickle.load(f)
+	assert all_quotes == dat['quotes']
+	all_quote_similarities = dat['similarities']
 
 	# Get the Tokenizer used for pretraining model
 	tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
 	PRETRAINED_MASK_TOKEN = tokenizer.mask_token
 	PRETRAINED_MASK_TOKEN_ID = tokenizer.convert_tokens_to_ids(PRETRAINED_MASK_TOKEN)
 
-	print('loading train and valid data......')
+	print('Loading train and valid data')
 	train_input_ids, train_token_type_ids, train_attention_masks, train_mask_ids = make_context_tensors(train_former, train_latter)
 	valid_input_ids, valid_token_type_ids, valid_attention_masks, valid_mask_ids = make_context_tensors(valid_former, valid_latter)
-	print('train bert input:')
-	print(train_input_ids.shape, train_token_type_ids.shape, train_attention_masks.shape, train_mask_ids.shape)
-	print('valid bert input:')
-	print(valid_input_ids.shape, valid_token_type_ids.shape, valid_attention_masks.shape, valid_mask_ids.shape)
+	print(f'train bert input: {train_input_ids.shape} {train_token_type_ids.shape} {train_attention_masks.shape} {train_mask_ids.shape}')
+	print(f'valid bert input: {valid_input_ids.shape} {valid_token_type_ids.shape} {valid_attention_masks.shape} {valid_mask_ids.shape}')
 
-	print('loading train and valid dataloader ...')
+	print('Loading train and valid dataloader')
 	train_dataset = Dataset(input_ids=train_input_ids,
 							token_type_ids=train_token_type_ids,
 							attention_masks=train_attention_masks,
@@ -545,7 +567,7 @@ if __name__ == '__main__':
 	train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 	valid_loader = DataLoader(dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
-	print('loading model......')
+	print('Loading model')
 	contex_model = Context_Encoder()
 	quote_model = Quote_Encoder(base=args.base)
 	model = QuotRec_Net(contex_model, quote_model)
@@ -563,7 +585,7 @@ if __name__ == '__main__':
 	# Generate sentence vector for quotes
 	quote_model = AutoModel.from_pretrained(PRETRAINED_MODEL_NAME)
 	model_dict = quote_model.state_dict()
-	save_model_state = torch.load(f'./model/{args.base}_english_quote.pth')
+	save_model_state = torch.load(f'./model/{args.base}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}_english_quote.pth')
 	state_dict = {k[11:]: v for k, v in save_model_state.items() if k[11:] in model_dict.keys()}
 	model_dict.update(state_dict)
 	quote_model.load_state_dict(model_dict)
@@ -582,14 +604,14 @@ if __name__ == '__main__':
 		quote_embeddings = torch.cat(quote_embeddings, dim=0)
 	print(f'quote tensor: {quote_embeddings.shape}')
 
-	print('loading model......')
+	print('Loading model')
 	model = QuotRecNet()
 	model.to(device)
 
 	train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True, num_workers=2)
 	valid_loader = DataLoader(dataset=valid_dataset, batch_size=32, shuffle=True, num_workers=2)
 
-	print('start training......')
+	print('Start training')
 	training_mask(model=model,
 				  epoch=NUM_EPOCHS,
 				  train=train_loader,
@@ -597,7 +619,7 @@ if __name__ == '__main__':
 				  quote_tensor=quote_embeddings,
 				  device=device)
 
-	print('loading test tensor......')
+	print('Loading test tensor')
 	test_input_ids, test_token_type_ids, test_attention_masks, test_mask_ids = make_context_tensors(test_former, test_latter)
 	test_dataset = Dataset(input_ids=test_input_ids,
 						token_type_ids=test_token_type_ids,
@@ -607,8 +629,8 @@ if __name__ == '__main__':
 
 	test_loader = DataLoader(dataset=test_dataset, batch_size=32, num_workers=2)
 
-	print('loading model ...')
-	model = torch.load(f'./model/{args.base}_model_english.model')
+	print('Loading model')
+	model = torch.load(f'./model/{MODEL_SAVE_PATH}/model_english.model')
 	model.to(device)
 	test(model=model,
 		test_loader=test_loader,

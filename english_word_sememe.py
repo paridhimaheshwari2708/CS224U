@@ -3,7 +3,7 @@ import torch
 import argparse
 import OpenHowNet
 import numpy as np
-from transformers import BertTokenizer, AutoTokenizer
+from transformers import AutoTokenizer
 
 
 # load english dataset
@@ -37,7 +37,7 @@ def load_data(path):
 if __name__ == '__main__':
 
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--base", dest="base", action="store", type=str, choices=['bert', 'roberta', 'distilbert'])
+	parser.add_argument("--base", dest="base", action="store", type=str, choices=['bert', 'roberta', 'distilbert', 'mobilebert'])
 	args = parser.parse_args()
 
 	if args.base == 'bert':
@@ -46,6 +46,8 @@ if __name__ == '__main__':
 		PRETRAINED_MODEL_NAME = 'roberta-base'
 	elif args.base == 'distilbert':
 		PRETRAINED_MODEL_NAME = 'distilbert-base-uncased'
+	elif args.base == 'mobilebert':
+		PRETRAINED_MODEL_NAME = 'google/mobilebert-uncased'
 
 	print("loading dataset......")
 	data_path = "./data/english.txt"

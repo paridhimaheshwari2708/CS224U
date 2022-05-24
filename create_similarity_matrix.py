@@ -5,6 +5,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from sklearn.metrics.pairwise import cosine_similarity
 
+
 # load english dataset
 def load_data(path):
 	# return words list and labels
@@ -32,11 +33,13 @@ def load_data(path):
 			test_former, test_latter, test_quote, \
 			torch.LongTensor(y_train), torch.LongTensor(y_valid), torch.LongTensor(y_test), all_quotes
 
+
 def mean_pooling(model_output, attention_mask):
 	# Take attention mask into account for correct averaging
 	token_embeddings = model_output[0] # First element of model_output contains all token embeddings
 	input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
 	return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
 
 def get_sentence_transformer_embeddings(sentences, pooling):
 	# Load model from HuggingFace Hub
@@ -57,9 +60,11 @@ def get_sentence_transformer_embeddings(sentences, pooling):
 
 	return sentence_embeddings
 
+
 def compute_similarity_matrix(sentence_embeddings):
 	similarities = cosine_similarity(sentence_embeddings)
 	return similarities
+
 
 if __name__ == '__main__':
 
@@ -77,12 +82,13 @@ if __name__ == '__main__':
 	print('Computing quote similarities')
 	all_quote_similarities = compute_similarity_matrix(all_quote_embeddings)
 	# Since cosine similarities varies from [-1, 1]
-	# Making it positive
-	all_quote_similarities += 1
+	# Making it positive and range [0, 1]
+	all_quote_similarities = (all_quote_similarities + 1) / 2
+	all_quote_similarities = np.clip(all_quote_similarities, 0, 1)
 
 	final = {
 		'quotes' : all_quotes,
 		'similarities' : all_quote_similarities,
 	}
-	with open(f'data/similarities_sentence_bert_{args.pooling}.pkl', 'wb') as f:
+	with open(f'data/similarities_{args.pooling}.pkl', 'wb') as f:
 		pickle.dump(final, f)
