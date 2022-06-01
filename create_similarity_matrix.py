@@ -2,6 +2,7 @@ import torch
 import pickle
 import argparse
 import numpy as np
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -81,10 +82,6 @@ if __name__ == '__main__':
 
 	print('Computing quote similarities')
 	all_quote_similarities = compute_similarity_matrix(all_quote_embeddings)
-	# Since cosine similarities varies from [-1, 1]
-	# Making it positive and range [0, 1]
-	all_quote_similarities = (all_quote_similarities + 1) / 2
-	all_quote_similarities = np.clip(all_quote_similarities, 0, 1)
 
 	final = {
 		'quotes' : all_quotes,
