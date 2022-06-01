@@ -22,7 +22,7 @@ python -c "from transformers import pipeline; print(pipeline('sentiment-analysis
 
 ###  2.1 Generate sememe data
 
-english_word_sememe.py is used to generate the corresponding language sememe data respectively.
+create_word_sememe.py is used to generate the corresponding language sememe data respectively.
 
 ### 2.2  Modify files in the Transformer Python library
 
@@ -32,4 +32,4 @@ Modify the modeling_distilbert.py file in the Transformer Python library and add
 
 ### 2.3  Model training and testing
 
-The file english_train_test.py is used for training and testing, respectively
+The file run.py is used for training and testing, respectively
