@@ -32,4 +32,4 @@ Modify the modeling_distilbert.py file in the Transformer Python library and add
 
 ### 2.3  Model training and testing
 
-The file run.py is used for training and testing, respectively
+run.py is used for training phase 1 and 2 as well as testing, respectively.

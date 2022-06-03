@@ -24,12 +24,12 @@ def load_data(path):
 	with open(path, 'r', encoding='utf-8') as f:
 		lines = f.readlines()
 		lines = [line.strip().lower().split('\t') for line in lines]
-		train_former = [line[0] for line in lines[:101171]]
-		train_quote = [line[1] for line in lines[:101171]]
-		train_latter = [line[2] for line in lines[:101171]]
-		# train_former = [line[0] for line in lines[101000:101171]]
-		# train_quote = [line[1] for line in lines[101000:101171]]
-		# train_latter = [line[2] for line in lines[101000:101171]]
+		# train_former = [line[0] for line in lines[:101171]]
+		# train_quote = [line[1] for line in lines[:101171]]
+		# train_latter = [line[2] for line in lines[:101171]]
+		train_former = [line[0] for line in lines[101000:101171]]
+		train_quote = [line[1] for line in lines[101000:101171]]
+		train_latter = [line[2] for line in lines[101000:101171]]
 		valid_former = [line[0] for line in lines[101171:113942]]
 		valid_quote = [line[1] for line in lines[101171:113942]]
 		valid_latter = [line[2] for line in lines[101171:113942]]
@@ -84,33 +84,50 @@ class Dataset(Dataset):
 		return self.input_ids[idx], self.token_type_ids[idx], self.attention_masks[idx], self.mask_ids[idx], self.quote[idx]
 
 
-#  Generate negative examples according to num
-def generate_quotes(quote, num, method):
-	pos_quote = quote
+def generate_quotes(anchor_quote, method):
+	anchor_idx = all_quotes.index(anchor_quote)
+	similarities = all_quote_similarities[anchor_idx, :]
+
 	if method == 'random':
-		quotes_select = all_quotes[:]
-		quotes_select.remove(quote)
-		neg_quotes = random.sample(quotes_select, num)
-	elif method == 'probability':
-		pos_idx = all_quotes.index(quote)
-		similarities = all_quote_similarities[pos_idx, :]
-		neg_probs = (1-similarities) / np.sum(1-similarities) # range is [0, 1]
-		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), size=num, p=neg_probs)
-		neg_quotes = [all_quotes[i] for i in neg_idx]
+		pos_idx = np.random.choice(np.arange(similarities.shape[0]))
+		neg_probs = (similarities <= similarities[pos_idx]).astype(int)
+		neg_probs = neg_probs / np.sum(neg_probs)
+		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), p=neg_probs)
+
 	elif method == 'extreme':
-		pos_idx = all_quotes.index(quote)
-		similarities = all_quote_similarities[pos_idx]
 		sorted_idx = np.argsort(similarities)
-		neg_idx = sorted_idx[:num]
-		neg_quotes = [all_quotes[i] for i in neg_idx]
-	quotes = neg_quotes + [pos_quote]
-	random.shuffle(quotes)
-	return pos_quote, quotes
+		neg_idx = np.argmin(sorted_idx)
+		similarities[anchor_idx] = 0
+		pos_idx = np.argmax(similarities)
+
+	elif method == 'probability':
+		pos_probs = similarities / np.sum(similarities)
+		neg_probs = (1-similarities) / np.sum(1-similarities) # range is [0, 1]
+		pos_idx = np.random.choice(np.arange(pos_probs.shape[0]), p=pos_probs)
+		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), p=neg_probs)
+
+	elif method == 'reject':
+		pos_probs = similarities / np.sum(similarities)
+		pos_idx = np.random.choice(np.arange(pos_probs.shape[0]), p=pos_probs)
+		neg_probs = (1-similarities) # range is [0, 1]
+		neg_probs[neg_probs < neg_probs[pos_idx]] = 0
+		neg_probs = neg_probs / np.sum(neg_probs)
+		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), p=neg_probs)
+
+	pos_quote = all_quotes[pos_idx]
+	neg_quote = all_quotes[neg_idx]
+
+	sim_ap = similarities[pos_idx]
+	sim_an = similarities[neg_idx]
+	weight = sim_ap / (sim_ap + sim_an)
+
+	return anchor_quote, pos_quote, neg_quote, weight
 
 
 def make_quote_tensors(quote):
-	pos_quote, quotes = generate_quotes(quote, num=NUM_NEGATIVES, method=SAMPLING_STRATEGY)
-	label = quotes.index(pos_quote)
+	anchor_quote, pos_quote, neg_quote, weight = generate_quotes(quote, method=SAMPLING_STRATEGY)
+	quotes = [anchor_quote] + [pos_quote] + [neg_quote]
+
 	input_ids = []
 	encoded_dict = tokenizer.batch_encode_plus(quotes,
 											add_special_tokens=True,
@@ -118,9 +135,9 @@ def make_quote_tensors(quote):
 											pad_to_max_length=True,
 											truncation=True,
 											return_tensors='pt')
-	input_ids = encoded_dict['input_ids']  # [num, 80]
+	input_ids = encoded_dict['input_ids']  # [1 + 1 + 1, 80]
 	quote_ids = [all_quotes_dict[q] for q in quotes]
-	return input_ids, label, torch.LongTensor(quote_ids)
+	return input_ids, torch.LongTensor(quote_ids), weight
 
 
 # Define network
@@ -157,10 +174,10 @@ class Quote_Encoder(nn.Module):
 		# self.dropout = nn.Dropout(0.5)
 
 	def forward(self, quotes):
-		quote_tensor = []
-		labels = []
+		quote_tensor, weights = [], []
 		for quote in quotes:
-			quote_input_ids, label, quote_ids = make_quote_tensors(quote)
+			quote_input_ids, quote_ids, weight = make_quote_tensors(quote)
+			weights.append(weight)
 			quote_input_ids = quote_input_ids.to(device)
 			quote_ids = quote_ids.to(device)
 			outputs = self.bert_model(input_ids=quote_input_ids, quote_ids=quote_ids)
@@ -168,28 +185,73 @@ class Quote_Encoder(nn.Module):
 			# last_hidden_state = self.dropout(last_hidden_state)
 			output = torch.mean(last_hidden_state, dim=1)  # (num, hidden_size))
 			quote_tensor.append(output)
-			labels.append(label)
 		quote_tensor = torch.stack(quote_tensor, dim=0)  # (batch, num, hidden_size))
-		return quote_tensor, labels
+		weights = torch.tensor(weights)  # (batch)
+		return quote_tensor, weights
 
 
 class QuotRec_Net(nn.Module):
-	def __init__(self, contex_model, quote_model):
+	def __init__(self, context_model, quote_model):
 		super().__init__()
-		self.contex_model = contex_model
+		self.context_model = context_model
 		self.quote_model = quote_model
 
 	def forward(self, input_ids, token_type_ids, attention_masks, mask_ids, quotes):
 		# context_output: [batch, hidden_size]
-		context_output = self.contex_model(input_ids, token_type_ids, attention_masks, mask_ids)
+		context_output = self.context_model(input_ids, token_type_ids, attention_masks, mask_ids)
 		context_output = context_output.unsqueeze(dim=1)  # [batch, 1, hidden_size]
 
-		# quote_output: [batch, num, hidden_size]  labels: [batch]
-		quote_output, labels = self.quote_model(quotes)
+		# quote_output: [batch, num, hidden_size]
+		quote_output, weights = self.quote_model(quotes)
+		import pdb; pdb.set_trace()
 		quote_output = quote_output.permute(0, 2, 1)
 
 		outputs = torch.matmul(context_output, quote_output).squeeze(dim=1)  # output: [batch, num_quotes]
-		return outputs, torch.LongTensor(labels)
+		return outputs, weight
+
+
+class loss_ranking():
+    def __init__(self):
+        self.sigmoid = torch.nn.Sigmoid()
+        self.cos = torch.nn.CosineSimilarity()
+        self.crossEntropy = torch.nn.BCELoss()
+
+    def __call__(self, embed, pos_embed, neg_embed, weight):
+        dtype, device = embed.dtype, embed.device
+        pos_scores = self.cos(embed, pos_embed)
+        neg_scores = self.cos(embed, neg_embed)
+        distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_RANKING_V)
+        loss = self.crossEntropy(distances, weight)
+        return loss
+
+
+class loss_infonce():
+    def __init__(self):
+        self.sigmoid = torch.nn.Sigmoid()
+        self.cos = torch.nn.CosineSimilarity()
+        self.crossEntropy = torch.nn.BCELoss()
+
+    def __call__(self, embed, pos_embed, neg_embed, weight):
+        dtype, device = embed.dtype, embed.device
+        pos_scores = self.cos(embed, pos_embed)
+        neg_scores = self.cos(embed, neg_embed)
+        distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_INFONCE_V)
+        loss = self.crossEntropy(distances, torch.ones(distances.size(0), device=device, dtype=dtype))
+        return loss
+
+
+class loss_triplet():
+    def __init__(self):
+        self.cos = torch.nn.CosineSimilarity()
+        self.ReLU = torch.nn.ReLU()
+        self.margin = torch.nn.MarginRankingLoss(margin = LOSS_TRIPLET_C)
+
+    def __call__(self, embed, pos_embed, neg_embed, weight):
+        pos_scores = self.cos(embed, pos_embed)
+        neg_scores = self.cos(embed, neg_embed)
+        distances = self.ReLU(neg_scores - pos_scores + LOSS_TRIPLET_C)
+        loss = torch.sum(distances)
+        return loss
 
 
 def training(model, epoch, train, valid, device):
@@ -200,7 +262,7 @@ def training(model, epoch, train, valid, device):
 	v_batch = len(valid)
 
 	model.train()
-	criterion = nn.CrossEntropyLoss()
+	criterion = loss_infonce()
 	optimizer = AdamW(model.parameters(), lr=learning_rate)
 	best_acc = 0
 	count = 0
@@ -215,9 +277,11 @@ def training(model, epoch, train, valid, device):
 			attention_masks = attention_masks.to(device)
 			mask_ids = mask_ids.to(device, dtype=torch.long)
 			optimizer.zero_grad()
-			outputs, labels = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
-			labels = labels.to(device, dtype=torch.long)
-			loss = criterion(outputs, labels)
+			outputs, weight = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
+			import pdb; pdb.set_trace()
+			print(outputs.shape)
+
+			loss = criterion(outputs)
 			loss.backward()
 			optimizer.step()
 			_, pred = torch.max(outputs.cpu().data, 1)
@@ -235,9 +299,8 @@ def training(model, epoch, train, valid, device):
 				token_type_ids = token_type_ids.to(device)
 				attention_masks = attention_masks.to(device)
 				mask_ids = mask_ids.to(device, dtype=torch.long)
-				outputs, labels = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
-				labels = labels.to(device, dtype=torch.long)
-				loss = criterion(outputs, labels)
+				outputs, weight = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
+				loss = criterion(outputs)
 				_, pred = torch.max(outputs.cpu().data, 1)
 				acc = accuracy_score(pred, labels.cpu())
 				total_loss += loss.item()
@@ -247,7 +310,7 @@ def training(model, epoch, train, valid, device):
 			if total_acc > best_acc:
 				best_acc = total_acc
 				torch.save(model.quote_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_quote.pth')
-				torch.save(model.contex_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_context.pth')
+				torch.save(model.context_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_context.pth')
 				print('saving model with Acc {:.3f} '.format(total_acc / v_batch))
 				count = 0
 			else:
@@ -524,9 +587,11 @@ if __name__ == '__main__':
 	parser.add_argument("--sampling", dest="sampling", action="store", type=str, default='random', choices=['random', 'extreme', 'probability'])
 	parser.add_argument("--batch_size", dest="batch_size", action="store", type=int, default=4)
 	parser.add_argument("--num_epochs", dest="num_epochs", action="store", type=int, default=40)
-	parser.add_argument("--num_negatives", dest="num_negatives", action="store", type=int, default=19)
+	parser.add_argument("--num_positives", dest="num_positives", action="store", type=int, default=1)
+	parser.add_argument("--num_negatives", dest="num_negatives", action="store", type=int, default=1)
 	args = parser.parse_args()
 
+	NUM_POSITIVES = args.num_positives
 	NUM_NEGATIVES = args.num_negatives
 	BATCH_SIZE = args.batch_size
 	NUM_EPOCHS = args.num_epochs
@@ -592,9 +657,9 @@ if __name__ == '__main__':
 		valid_loader = DataLoader(dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
 		print('Loading model')
-		contex_model = Context_Encoder()
+		context_model = Context_Encoder()
 		quote_model = Quote_Encoder(base=args.base)
-		model = QuotRec_Net(contex_model, quote_model)
+		model = QuotRec_Net(context_model, quote_model)
 		model.to(device)
 
 		training(model=model,

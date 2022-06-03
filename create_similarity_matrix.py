@@ -1,10 +1,7 @@
 import torch
 import pickle
-import argparse
 import numpy as np
-import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
-from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer, util
 
 
 # load english dataset
@@ -46,19 +43,15 @@ def get_sentence_transformer_embeddings(sentences, pooling):
 	# Load model from HuggingFace Hub
 	tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
 	model = AutoModel.from_pretrained('sentence-transformers/bert-base-nli-mean-tokens')
-
 	# Tokenize sentences
 	encoded_input = tokenizer(sentences, padding=True, truncation=True, return_tensors='pt')
-
 	# Compute token embeddings
 	with torch.no_grad():
 		model_output = model(**encoded_input)
-
 	if pooling == 'mean':
 		sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
 	elif pooling == 'cls':
 		sentence_embeddings = model_output[0][:, 0, :]
-
 	return sentence_embeddings
 
 
@@ -69,23 +62,20 @@ def compute_similarity_matrix(sentence_embeddings):
 
 if __name__ == '__main__':
 
-	parser = argparse.ArgumentParser()
-	parser.add_argument("--pooling", dest="pooling", action="store", type=str, choices=['cls', 'mean'])
-	args = parser.parse_args()
-
-	print('loading dataset......')
+	# Loading dataset
 	data_path = './data/english.txt'
 	train_former, train_latter, train_quote, valid_former, valid_latter, valid_quote, test_former, test_latter, test_quote, y_train, y_valid, y_test, all_quotes = load_data(data_path)
 
-	print('Getting quote embeddings')
-	all_quote_embeddings = get_sentence_transformer_embeddings(all_quotes, args.pooling)
+	# Compute embedding for all quotes
+	model = SentenceTransformer('all-MiniLM-L6-v2')
+	all_quote_embeddings = model.encode(all_quotes, convert_to_tensor=True)
 
-	print('Computing quote similarities')
-	all_quote_similarities = compute_similarity_matrix(all_quote_embeddings)
+	# Compute cosine similarities
+	all_quote_similarities = util.cos_sim(all_quote_embeddings, all_quote_embeddings).cpu().numpy()
 
 	final = {
 		'quotes' : all_quotes,
 		'similarities' : all_quote_similarities,
 	}
-	with open(f'data/similarities_{args.pooling}.pkl', 'wb') as f:
+	with open('data/similarities.pkl', 'wb') as f:
 		pickle.dump(final, f)
