@@ -18,6 +18,8 @@ print(f'Using device: {device}')
 
 learning_rate = 3e-5
 
+SIMILARITIES_TEMPERATURE = 1
+
 # load english dataset
 def load_data(path):
 	# return words list and labels
@@ -27,9 +29,6 @@ def load_data(path):
 		train_former = [line[0] for line in lines[:101171]]
 		train_quote = [line[1] for line in lines[:101171]]
 		train_latter = [line[2] for line in lines[:101171]]
-		# train_former = [line[0] for line in lines[101000:101171]]
-		# train_quote = [line[1] for line in lines[101000:101171]]
-		# train_latter = [line[2] for line in lines[101000:101171]]
 		valid_former = [line[0] for line in lines[101171:113942]]
 		valid_quote = [line[1] for line in lines[101171:113942]]
 		valid_latter = [line[2] for line in lines[101171:113942]]
@@ -173,7 +172,7 @@ class Quote_Encoder(nn.Module):
 		return quote_tensor, labels
 
 
-class QuotRec_Net(nn.Module):
+class QuotRecNet1(nn.Module):
 	def __init__(self, contex_model, quote_model):
 		super().__init__()
 		self.contex_model = contex_model
@@ -275,7 +274,7 @@ def make_tensors(quotes):
 
 
 # Use the mask method for training
-class QuotRecNet(nn.Module):
+class QuotRecNet2(nn.Module):
 	def __init__(self):
 		super().__init__()
 		self.bert_model = AutoModel.from_pretrained(PRETRAINED_MODEL_NAME)
@@ -532,7 +531,7 @@ if __name__ == '__main__':
 	NUM_EPOCHS = args.num_epochs
 	SAMPLING_STRATEGY = args.sampling
 
-	MODEL_SAVE_PATH = f'{args.base}_tmp_{SAMPLING_STRATEGY}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}'
+	MODEL_SAVE_PATH = f'{args.base}_{SAMPLING_STRATEGY}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}'
 	os.makedirs(f'model/{MODEL_SAVE_PATH}', exist_ok=True)
 	print(f'Model: {MODEL_SAVE_PATH}')
 
@@ -577,7 +576,7 @@ if __name__ == '__main__':
 							quote=valid_quote)
 
 
-	if args.phase == 'phase1':
+	if args.phase == 'train1':
 		# Loading quote similarities for weak supervision
 		with open(similarities_path, 'rb') as f:
 			dat = pickle.load(f)
@@ -585,8 +584,7 @@ if __name__ == '__main__':
 		all_quote_similarities = dat['similarities']
 
 		# Converting cosine similarities to probabilities
-		# Paridhi TODO: Temperature hyperparameter
-		all_quote_similarities = F.softmax(torch.tensor(all_quote_similarities), dim=1).numpy()
+		all_quote_similarities = F.softmax(torch.tensor(all_quote_similarities / SIMILARITIES_TEMPERATURE), dim=1).numpy()
 
 		train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 		valid_loader = DataLoader(dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
@@ -594,7 +592,7 @@ if __name__ == '__main__':
 		print('Loading model')
 		contex_model = Context_Encoder()
 		quote_model = Quote_Encoder(base=args.base)
-		model = QuotRec_Net(contex_model, quote_model)
+		model = QuotRecNet1(contex_model, quote_model)
 		model.to(device)
 
 		training(model=model,
@@ -603,12 +601,12 @@ if __name__ == '__main__':
 				valid=valid_loader,
 				device=device)
 
-	elif args.phase == 'phase2':
+	elif args.phase == 'train2':
 		quote_embeddings = generate_quote_tensors(all_quotes)
 		print(f'quote tensor: {quote_embeddings.shape}')
 
 		print('Loading model')
-		model = QuotRecNet()
+		model = QuotRecNet2()
 		model.to(device)
 
 		train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True, num_workers=2)

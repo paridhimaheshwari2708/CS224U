@@ -32,4 +32,7 @@ Modify the modeling_distilbert.py file in the Transformer Python library and add
 
 ### 2.3  Model training and testing
 
-run.py is used for training phase 1 and 2 as well as testing, respectively.
+run*.py is used for training phase 1 and 2 as well as testing, respectively.
+- run.py is for training the quoteR baseline.
+- run_contrastive.py incorporates positive and negative sampling strategies as well as contrastive losses for training.
+

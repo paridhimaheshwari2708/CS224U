@@ -18,18 +18,23 @@ print(f'Using device: {device}')
 
 learning_rate = 3e-5
 
+SIMILARITIES_TEMPERATURE = 1
+
+SAMPLING_POS_PROBABILITY = 0.3
+
+LOSS_RANKING_V = 1
+LOSS_INFONCE_V = 1
+LOSS_TRIPLET_C = 0.5
+
 # load english dataset
 def load_data(path):
 	# return words list and labels
 	with open(path, 'r', encoding='utf-8') as f:
 		lines = f.readlines()
 		lines = [line.strip().lower().split('\t') for line in lines]
-		# train_former = [line[0] for line in lines[:101171]]
-		# train_quote = [line[1] for line in lines[:101171]]
-		# train_latter = [line[2] for line in lines[:101171]]
-		train_former = [line[0] for line in lines[101000:101171]]
-		train_quote = [line[1] for line in lines[101000:101171]]
-		train_latter = [line[2] for line in lines[101000:101171]]
+		train_former = [line[0] for line in lines[:101171]]
+		train_quote = [line[1] for line in lines[:101171]]
+		train_latter = [line[2] for line in lines[:101171]]
 		valid_former = [line[0] for line in lines[101171:113942]]
 		valid_quote = [line[1] for line in lines[101171:113942]]
 		valid_latter = [line[2] for line in lines[101171:113942]]
@@ -114,19 +119,22 @@ def generate_quotes(anchor_quote, method):
 		neg_probs = neg_probs / np.sum(neg_probs)
 		neg_idx = np.random.choice(np.arange(neg_probs.shape[0]), p=neg_probs)
 
-	pos_quote = all_quotes[pos_idx]
 	neg_quote = all_quotes[neg_idx]
-
-	sim_ap = similarities[pos_idx]
 	sim_an = similarities[neg_idx]
+	if random.uniform(0, 1) < SAMPLING_POS_PROBABILITY:
+		pos_quote = all_quotes[pos_idx]
+		sim_ap = similarities[pos_idx]
+	else:
+		pos_quote = anchor_quote
+		sim_ap = np.float32(1.0)
 	weight = sim_ap / (sim_ap + sim_an)
 
-	return anchor_quote, pos_quote, neg_quote, weight
+	return pos_quote, neg_quote, weight
 
 
 def make_quote_tensors(quote):
-	anchor_quote, pos_quote, neg_quote, weight = generate_quotes(quote, method=SAMPLING_STRATEGY)
-	quotes = [anchor_quote] + [pos_quote] + [neg_quote]
+	pos_quote, neg_quote, weight = generate_quotes(quote, method=SAMPLING_STRATEGY)
+	quotes = [pos_quote] + [neg_quote]
 
 	input_ids = []
 	encoded_dict = tokenizer.batch_encode_plus(quotes,
@@ -135,7 +143,7 @@ def make_quote_tensors(quote):
 											pad_to_max_length=True,
 											truncation=True,
 											return_tensors='pt')
-	input_ids = encoded_dict['input_ids']  # [1 + 1 + 1, 80]
+	input_ids = encoded_dict['input_ids']  # [NUM_POSITIVES + NUM_NEGATIVES, 80]
 	quote_ids = [all_quotes_dict[q] for q in quotes]
 	return input_ids, torch.LongTensor(quote_ids), weight
 
@@ -177,7 +185,6 @@ class Quote_Encoder(nn.Module):
 		quote_tensor, weights = [], []
 		for quote in quotes:
 			quote_input_ids, quote_ids, weight = make_quote_tensors(quote)
-			weights.append(weight)
 			quote_input_ids = quote_input_ids.to(device)
 			quote_ids = quote_ids.to(device)
 			outputs = self.bert_model(input_ids=quote_input_ids, quote_ids=quote_ids)
@@ -185,12 +192,13 @@ class Quote_Encoder(nn.Module):
 			# last_hidden_state = self.dropout(last_hidden_state)
 			output = torch.mean(last_hidden_state, dim=1)  # (num, hidden_size))
 			quote_tensor.append(output)
+			weights.append(weight)
 		quote_tensor = torch.stack(quote_tensor, dim=0)  # (batch, num, hidden_size))
-		weights = torch.tensor(weights)  # (batch)
+		weights = torch.tensor(weights).to(device)  # (batch)
 		return quote_tensor, weights
 
 
-class QuotRec_Net(nn.Module):
+class QuotRecNet1(nn.Module):
 	def __init__(self, context_model, quote_model):
 		super().__init__()
 		self.context_model = context_model
@@ -203,55 +211,46 @@ class QuotRec_Net(nn.Module):
 
 		# quote_output: [batch, num, hidden_size]
 		quote_output, weights = self.quote_model(quotes)
-		import pdb; pdb.set_trace()
 		quote_output = quote_output.permute(0, 2, 1)
 
 		outputs = torch.matmul(context_output, quote_output).squeeze(dim=1)  # output: [batch, num_quotes]
-		return outputs, weight
+		return outputs, weights
 
 
 class loss_ranking():
-    def __init__(self):
-        self.sigmoid = torch.nn.Sigmoid()
-        self.cos = torch.nn.CosineSimilarity()
-        self.crossEntropy = torch.nn.BCELoss()
+	def __init__(self):
+		self.sigmoid = torch.nn.Sigmoid()
+		self.crossEntropy = torch.nn.BCELoss()
 
-    def __call__(self, embed, pos_embed, neg_embed, weight):
-        dtype, device = embed.dtype, embed.device
-        pos_scores = self.cos(embed, pos_embed)
-        neg_scores = self.cos(embed, neg_embed)
-        distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_RANKING_V)
-        loss = self.crossEntropy(distances, weight)
-        return loss
+	def __call__(self, scores, weights):
+		pos_scores, neg_scores = scores[:, 0], scores[:, 1]
+		distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_RANKING_V)
+		loss = self.crossEntropy(distances, weights)
+		return loss
 
 
 class loss_infonce():
-    def __init__(self):
-        self.sigmoid = torch.nn.Sigmoid()
-        self.cos = torch.nn.CosineSimilarity()
-        self.crossEntropy = torch.nn.BCELoss()
+	def __init__(self):
+		self.sigmoid = torch.nn.Sigmoid()
+		self.crossEntropy = torch.nn.BCELoss()
 
-    def __call__(self, embed, pos_embed, neg_embed, weight):
-        dtype, device = embed.dtype, embed.device
-        pos_scores = self.cos(embed, pos_embed)
-        neg_scores = self.cos(embed, neg_embed)
-        distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_INFONCE_V)
-        loss = self.crossEntropy(distances, torch.ones(distances.size(0), device=device, dtype=dtype))
-        return loss
+	def __call__(self, scores, weights):
+		pos_scores, neg_scores = scores[:, 0], scores[:, 1]
+		distances = self.sigmoid( (pos_scores - neg_scores) / LOSS_INFONCE_V)
+		loss = self.crossEntropy(distances, torch.ones(distances.size(0)).to(device))
+		return loss
 
 
 class loss_triplet():
-    def __init__(self):
-        self.cos = torch.nn.CosineSimilarity()
-        self.ReLU = torch.nn.ReLU()
-        self.margin = torch.nn.MarginRankingLoss(margin = LOSS_TRIPLET_C)
+	def __init__(self):
+		self.ReLU = torch.nn.ReLU()
+		self.margin = torch.nn.MarginRankingLoss(margin = LOSS_TRIPLET_C)
 
-    def __call__(self, embed, pos_embed, neg_embed, weight):
-        pos_scores = self.cos(embed, pos_embed)
-        neg_scores = self.cos(embed, neg_embed)
-        distances = self.ReLU(neg_scores - pos_scores + LOSS_TRIPLET_C)
-        loss = torch.sum(distances)
-        return loss
+	def __call__(self, scores, weights):
+		pos_scores, neg_scores = scores[:, 0], scores[:, 1]
+		distances = self.ReLU(neg_scores - pos_scores + LOSS_TRIPLET_C)
+		loss = torch.sum(distances)
+		return loss
 
 
 def training(model, epoch, train, valid, device):
@@ -262,9 +261,11 @@ def training(model, epoch, train, valid, device):
 	v_batch = len(valid)
 
 	model.train()
-	criterion = loss_infonce()
+	criterion = globals()[f'loss_{LOSS_FUNCTION}']()
 	optimizer = AdamW(model.parameters(), lr=learning_rate)
-	best_acc = 0
+
+	# best_acc = 0
+	best_loss = float('inf')
 	count = 0
 	for curr_epoch in range(epoch):
 		start = time.perf_counter()
@@ -277,18 +278,16 @@ def training(model, epoch, train, valid, device):
 			attention_masks = attention_masks.to(device)
 			mask_ids = mask_ids.to(device, dtype=torch.long)
 			optimizer.zero_grad()
-			outputs, weight = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
-			import pdb; pdb.set_trace()
-			print(outputs.shape)
-
-			loss = criterion(outputs)
+			scores, weights = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
+			loss = criterion(scores, weights)
 			loss.backward()
 			optimizer.step()
-			_, pred = torch.max(outputs.cpu().data, 1)
-			acc = accuracy_score(pred, labels.cpu())
+			_, pred = torch.max(scores.cpu().data, 1)
+			# acc = accuracy_score(pred, labels.cpu())
 			total_loss += loss.item()
-			total_acc += acc
-		print('Train | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / t_batch))
+			# total_acc += acc
+		print('Train | Loss: {:.5f}'.format(total_loss))
+		# print('Train | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / t_batch))
 
 		# Validation
 		model.eval()
@@ -299,19 +298,23 @@ def training(model, epoch, train, valid, device):
 				token_type_ids = token_type_ids.to(device)
 				attention_masks = attention_masks.to(device)
 				mask_ids = mask_ids.to(device, dtype=torch.long)
-				outputs, weight = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
-				loss = criterion(outputs)
-				_, pred = torch.max(outputs.cpu().data, 1)
-				acc = accuracy_score(pred, labels.cpu())
+				scores, weights = model(input_ids, token_type_ids, attention_masks, mask_ids, quotes)
+				loss = criterion(scores, weights)
+				_, pred = torch.max(scores.cpu().data, 1)
+				# acc = accuracy_score(pred, labels.cpu())
 				total_loss += loss.item()
-				total_acc += acc
-			print('Valid | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / v_batch))
+				# total_acc += acc
+			# print('Valid | Loss: {:.5f} Accuracy: {:.3f}'.format(total_loss, total_acc / v_batch))
+			print('Valid | Loss: {:.5f}'.format(total_loss))
 
-			if total_acc > best_acc:
-				best_acc = total_acc
+			# if total_acc > best_acc:
+				# best_acc = total_acc
+			if total_loss < best_loss:
+				best_loss = total_loss
 				torch.save(model.quote_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_quote.pth')
 				torch.save(model.context_model.state_dict(), f'./model/{MODEL_SAVE_PATH}/english_context.pth')
-				print('saving model with Acc {:.3f} '.format(total_acc / v_batch))
+				# print('saving model with Acc {:.3f} '.format(total_acc / v_batch))
+				print('saving model with loss {:.3f} '.format(total_loss / v_batch))
 				count = 0
 			else:
 				count += 1
@@ -338,7 +341,7 @@ def make_tensors(quotes):
 
 
 # Use the mask method for training
-class QuotRecNet(nn.Module):
+class QuotRecNet2(nn.Module):
 	def __init__(self):
 		super().__init__()
 		self.bert_model = AutoModel.from_pretrained(PRETRAINED_MODEL_NAME)
@@ -582,9 +585,10 @@ def test(model, test_loader, quote_tensor, device):
 if __name__ == '__main__':
 
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--phase", dest="phase", action="store", type=str)
-	parser.add_argument("--base", dest="base", action="store", type=str, choices=['bert', 'distilbert'])
-	parser.add_argument("--sampling", dest="sampling", action="store", type=str, default='random', choices=['random', 'extreme', 'probability'])
+	parser.add_argument("--phase", dest="phase", action="store", type=str, required=True)
+	parser.add_argument("--base", dest="base", action="store", type=str, required=True, choices=['bert', 'distilbert'])
+	parser.add_argument("--lossfn", dest="lossfn", action="store", type=str, required=True, choices=['infonce', 'triplet', 'ranking'])
+	parser.add_argument("--sampling", dest="sampling", action="store", type=str, required=True, choices=['random', 'extreme', 'probability', 'reject'])
 	parser.add_argument("--batch_size", dest="batch_size", action="store", type=int, default=4)
 	parser.add_argument("--num_epochs", dest="num_epochs", action="store", type=int, default=40)
 	parser.add_argument("--num_positives", dest="num_positives", action="store", type=int, default=1)
@@ -595,9 +599,10 @@ if __name__ == '__main__':
 	NUM_NEGATIVES = args.num_negatives
 	BATCH_SIZE = args.batch_size
 	NUM_EPOCHS = args.num_epochs
+	LOSS_FUNCTION = args.lossfn
 	SAMPLING_STRATEGY = args.sampling
 
-	MODEL_SAVE_PATH = f'{args.base}_tmp_{SAMPLING_STRATEGY}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}'
+	MODEL_SAVE_PATH = f'{args.base}_{LOSS_FUNCTION}_{SAMPLING_STRATEGY}_pos{SAMPLING_POS_PROBABILITY}_neg{NUM_NEGATIVES}_bs{BATCH_SIZE}_epochs{NUM_EPOCHS}'
 	os.makedirs(f'model/{MODEL_SAVE_PATH}', exist_ok=True)
 	print(f'Model: {MODEL_SAVE_PATH}')
 
@@ -642,7 +647,7 @@ if __name__ == '__main__':
 							quote=valid_quote)
 
 
-	if args.phase == 'phase1':
+	if args.phase == 'train1':
 		# Loading quote similarities for weak supervision
 		with open(similarities_path, 'rb') as f:
 			dat = pickle.load(f)
@@ -650,8 +655,7 @@ if __name__ == '__main__':
 		all_quote_similarities = dat['similarities']
 
 		# Converting cosine similarities to probabilities
-		# Paridhi TODO: Temperature hyperparameter
-		all_quote_similarities = F.softmax(torch.tensor(all_quote_similarities), dim=1).numpy()
+		all_quote_similarities = F.softmax(torch.tensor(all_quote_similarities / SIMILARITIES_TEMPERATURE), dim=1).numpy()
 
 		train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 		valid_loader = DataLoader(dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
@@ -659,7 +663,7 @@ if __name__ == '__main__':
 		print('Loading model')
 		context_model = Context_Encoder()
 		quote_model = Quote_Encoder(base=args.base)
-		model = QuotRec_Net(context_model, quote_model)
+		model = QuotRecNet1(context_model, quote_model)
 		model.to(device)
 
 		training(model=model,
@@ -668,12 +672,12 @@ if __name__ == '__main__':
 				valid=valid_loader,
 				device=device)
 
-	elif args.phase == 'phase2':
+	elif args.phase == 'train2':
 		quote_embeddings = generate_quote_tensors(all_quotes)
 		print(f'quote tensor: {quote_embeddings.shape}')
 
 		print('Loading model')
-		model = QuotRecNet()
+		model = QuotRecNet2()
 		model.to(device)
 
 		train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True, num_workers=2)
