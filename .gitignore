@@ -2,3 +2,5 @@ transformers/**
 
 data/**
 model/**
+
+glove*

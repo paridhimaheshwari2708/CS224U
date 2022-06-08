@@ -1,6 +1,9 @@
 import os
+import re
 import time
+import nltk
 import torch
+import faiss
 import pickle
 import random
 import argparse
@@ -19,6 +22,9 @@ print(f'Using device: {device}')
 learning_rate = 3e-5
 
 SIMILARITIES_TEMPERATURE = 1
+
+glove_lookup = None
+tokenizer = nltk.tokenize.RegexpTokenizer(r'\w+')
 
 # load english dataset
 def load_data(path):
@@ -67,20 +73,19 @@ def make_context_tensors(former, latter):
 
 # Dataset and DataLoader
 class Dataset(Dataset):
-	def __init__(self, input_ids, token_type_ids, attention_masks, mask_ids, quote):
+	def __init__(self, input_ids, token_type_ids, attention_masks, mask_ids, quote, bog_embed=None):
 		self.input_ids = input_ids
 		self.token_type_ids = token_type_ids
 		self.attention_masks = attention_masks
 		self.mask_ids = mask_ids
 		self.quote = quote
+		self.bog_embed = np.array(bog_embed, dtype=np.float32)
 
 	def __len__(self):
 		return len(self.input_ids)
 
 	def __getitem__(self, idx):
-		if self.quote is None:
-			return self.input_ids[idx], self.token_type_ids[idx], self.attention_masks[idx], self.mask_ids[idx]
-		return self.input_ids[idx], self.token_type_ids[idx], self.attention_masks[idx], self.mask_ids[idx], self.quote[idx]
+		return self.input_ids[idx], self.token_type_ids[idx], self.attention_masks[idx], self.mask_ids[idx], self.quote[idx], self.bog_embed[idx]
 
 
 #  Generate negative examples according to num
@@ -461,18 +466,76 @@ def training_mask(model, epoch, train, valid, quote_tensor, device):
 		model.train()
 
 
+def randvec(n=50, lower=-0.5, upper=0.5):
+	return np.array([random.uniform(lower, upper) for i in range(n)])
+
+
+def embed2dict(src_filename):
+	if '840B.300d' in src_filename:
+		line_parser = lambda line: line.rsplit(" ", 300)
+	else:
+		line_parser = lambda line: line.strip().split()
+	data = {}
+	with open(src_filename, encoding='utf8') as f:
+		while True:
+			try:
+				line = next(f)
+				line = line_parser(line)
+				data[line[0]] = np.array(line[1: ], dtype=np.float64)
+			except StopIteration:
+				break
+			except UnicodeDecodeError:
+				pass
+	return data
+
+
+def create_pretrained_embedding(lookup, vocab, required_tokens=()):
+	dim = len(next(iter(lookup.values())))
+	embedding = np.array([lookup.get(w, randvec(dim)) for w in vocab])
+	for tok in required_tokens:
+		if tok not in vocab:
+			vocab.append(tok)
+			embedding = np.vstack((embedding, randvec(dim)))
+	return embedding, vocab
+
+
+def get_bog_embeddings(context_former, context_latter):
+	global glove_lookup
+	glove_file = 'glove.6B.300d.txt'
+	if glove_lookup==None:
+		glove_lookup = embed2dict(glove_file)
+
+	sentences = [a+' '+b for a,b in zip(context_former, context_latter)]
+	toks = [tokenizer.tokenize(s.lower()) for s in sentences]
+	vecs = []
+	for t in toks:
+		v = create_pretrained_embedding(glove_lookup, t)[0]
+		v = 1.0/(len(v[0]))*np.sum(v, axis = 0)
+		vecs.append(v)
+	return np.array(vecs, dtype=np.float32)
+
+
+def init_index():
+	index = faiss.IndexFlatL2(300)
+	quote_database = np.load('glove_vecs.npy')
+	quote_database = np.array(quote_database, dtype = np.float32)
+	return index
+
+
 def test(model, test_loader, quote_tensor, device):
 	print('start test')
 	model.eval()
 	t_batch = len(test_loader)
 	criterion = nn.CrossEntropyLoss()
 	quote_tensor = quote_tensor.to(device)
+	index = init_index()
+
 	with torch.no_grad():
 		total_loss, total_MRR, total_NDCG, total_ranks = 0, 0, 0, 0
 		total_recall_1, total_recall_3, total_recall_5, total_recall_10, total_recall_20, total_recall_30 = 0, 0, 0, 0, 0, 0
 		total_recall_100, total_recall_300, total_recall_500, total_recall_1000 = 0, 0, 0, 0
 		all_ranks = []
-		for i, (input_ids, token_type_ids, attention_masks, mask_ids, labels) in tqdm(enumerate(test_loader), total=len(test_loader)):
+		for i, (input_ids, token_type_ids, attention_masks, mask_ids, labels, bog_embeds) in tqdm(enumerate(test_loader), total=len(test_loader)):
 			input_ids = input_ids.to(device)
 			token_type_ids = token_type_ids.to(device)
 			attention_masks = attention_masks.to(device)
@@ -480,14 +543,16 @@ def test(model, test_loader, quote_tensor, device):
 			labels = torch.tensor([all_quotes_dict[q] for q in labels])
 			labels = labels.to(device, dtype=torch.long)
 			outputs = model(input_ids, token_type_ids, attention_masks, mask_ids, quote_tensor)
-			# Visualize output for batch size 1
-			# context = tokenizer.batch_decode(input_ids, skip_special_tokens=True)[0]
-			# gold_quote = all_quotes[labels]
-			# ranked_quotes = torch.argsort(outputs, descending=True)[0, :5].tolist()
-			# top_5_quotes = [all_quotes[idx] for idx in ranked_quotes]
-			# print('-'*50)
-			# print(f'CONTEXT: {context} \n GOLD QUOTE: {gold_quote} \n PREDICTED QUOTES: {top_5_quotes}')
-			# print('-'*50)
+
+			# Candidate quote selection
+			bog_embeds = np.array(bog_embeds, dtype=np.float32)
+			D, candidates = index.search(bog_embeds, 3000)
+			output_candidates = []
+			for output, candidate in zip(outputs, candidates):
+				output_candidates.append([out if i in candidate else 0 for i, out in enumerate(output)])
+			outputs = torch.Tensor(output_candidates)
+			outputs = outputs.to(device, dtype=torch.float)
+
 			loss = criterion(outputs, labels)
 			ranks = rank_gold(outputs, labels)
 			all_ranks.extend(ranks)
@@ -638,14 +703,15 @@ if __name__ == '__main__':
 
 		print('Loading test tensor')
 		test_input_ids, test_token_type_ids, test_attention_masks, test_mask_ids = make_context_tensors(test_former, test_latter)
+		bog_embed = get_bog_embeddings(test_former, test_latter)
 		test_dataset = Dataset(input_ids=test_input_ids,
 							token_type_ids=test_token_type_ids,
 							attention_masks=test_attention_masks,
 							mask_ids=test_mask_ids,
-							quote=test_quote)
+							quote=test_quote,
+							bog_embed=bog_embed)
 
-		# test_loader = DataLoader(dataset=test_dataset, batch_size=32, num_workers=2)
-		test_loader = DataLoader(dataset=test_dataset, batch_size=1, num_workers=2)
+		test_loader = DataLoader(dataset=test_dataset, batch_size=32, num_workers=2)
 
 		print('Loading model')
 		model = torch.load(f'./model/{MODEL_SAVE_PATH}/model_english.model')
